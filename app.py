@@ -17,40 +17,46 @@ from langchain_core.prompts import PromptTemplate
 from dotenv import load_dotenv
 
 load_dotenv()
-os.getenv("GOOGLE_API_KEY")
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 
-# read all pdf files and return text
+# read all pdf files and return a list of (filename, text) tuples
 
 
 def get_pdf_text(pdf_docs):
-    text = ""
+    docs = []
     for pdf in pdf_docs:
         pdf_reader = PdfReader(pdf)
+        text = ""
         for page in pdf_reader.pages:
-            text += page.extract_text()
-    return text
+            text += page.extract_text() or ""
+        docs.append((pdf.name, text))
+    return docs
 
-# split text into chunks
+# split each document's text into chunks, keeping track of the source file
 
 
-def get_text_chunks(text):
+def get_text_chunks(docs):
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=10000, chunk_overlap=1000)
-    chunks = splitter.split_text(text)
-    return chunks  # list of strings
+    chunks = []
+    metadatas = []
+    for filename, text in docs:
+        for chunk in splitter.split_text(text):
+            chunks.append(chunk)
+            metadatas.append({"source": filename})
+    return chunks, metadatas  # list of strings, list of dicts
 
-# get embeddings for each chunk
+# get embeddings for each chunk and store source metadata alongside
 
 
-def get_vector_store(chunks):
+def get_vector_store(chunks, metadatas):
     if not chunks:
         st.error("No text chunks to process. The PDF might be empty or unreadable.")
         return False
     try:
         embeddings = GoogleGenerativeAIEmbeddings(
-            model="models/embedding-001")  # type: ignore
-        vector_store = FAISS.from_texts(chunks, embedding=embeddings)
+            model="models/gemini-embedding-001")  # type: ignore
+        vector_store = FAISS.from_texts(chunks, embedding=embeddings, metadatas=metadatas)
         vector_store.save_local("faiss_index")
         return True
     except BlockedPromptException as e:
@@ -73,8 +79,7 @@ def get_conversational_chain():
     Answer:
     """
 
-    model = ChatGoogleGenerativeAI(model="gemini-pro",
-                                   client=genai,
+    model = ChatGoogleGenerativeAI(model="gemini-2.5-flash",
                                    temperature=0.3,
                                    )
     prompt = PromptTemplate(template=prompt_template,
@@ -91,10 +96,11 @@ def clear_chat_history():
 def user_input(user_question):
     try:
         embeddings = GoogleGenerativeAIEmbeddings(
-            model="models/embedding-001")  # type: ignore
+            model="models/gemini-embedding-001")  # type: ignore
 
-        new_db = FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True) 
+        new_db = FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True)
         docs = new_db.similarity_search(user_question)
+        sources = sorted({d.metadata.get("source", "unknown") for d in docs})
 
         chain = get_conversational_chain()
 
@@ -102,7 +108,9 @@ def user_input(user_question):
             {"input_documents": docs, "question": user_question}, return_only_outputs=True, )
 
         print(response)
-        return response
+        result = dict(response) if isinstance(response, dict) else {"output_text": str(response)}
+        result["sources"] = sources
+        return result
     except BlockedPromptException as e:
         print(f"Prompt was blocked by Gemini: {e}")
         return {"output_text": "I'm sorry, but I cannot process this request. The content was flagged by Google's safety filters. Please try rephrasing your question."}
@@ -119,7 +127,7 @@ def user_input(user_question):
 
 def main():
     st.set_page_config(
-        page_title="Gemini PDF Chatbot",
+        page_title="MultiPDF RAG Chatbot",
         page_icon="🤖"
     )
 
@@ -131,16 +139,16 @@ def main():
         if st.button("Submit & Process"):
             if pdf_docs:
                 with st.spinner("Processing..."):
-                    raw_text = get_pdf_text(pdf_docs)
-                    text_chunks = get_text_chunks(raw_text)
-                    if get_vector_store(text_chunks):
+                    raw_docs = get_pdf_text(pdf_docs)
+                    text_chunks, metadatas = get_text_chunks(raw_docs)
+                    if get_vector_store(text_chunks, metadatas):
                         st.success("Done")
             else:
                 st.error("Please upload at least one PDF file before processing.")
 
     # Main content area for displaying chat messages
-    st.title("Chat with PDF files using Gemini🤖")
-    st.write("Welcome to the chat!")
+    st.title("Chat with your PDFs 📚🤖")
+    st.write("Upload PDFs, then ask questions — answers cite their source documents.")
     st.sidebar.button('Clear Chat History', on_click=clear_chat_history)
 
     # Chat input
@@ -175,6 +183,9 @@ def main():
                         for item in output_text:
                             full_response += item
                             placeholder.markdown(full_response)
+                    sources = response.get("sources")
+                    if sources:
+                        full_response += "\n\n📄 *Sources: " + ", ".join(sources) + "*"
                     message = {"role": "assistant", "content": full_response}
                     st.session_state.messages.append(message)
                 else:
